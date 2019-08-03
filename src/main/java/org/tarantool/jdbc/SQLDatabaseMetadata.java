@@ -4,6 +4,7 @@ import static org.tarantool.util.JdbcConstants.DatabaseMetadataTable;
 
 import org.tarantool.SqlProtoUtils;
 import org.tarantool.Version;
+import org.tarantool.util.StringUtils;
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
@@ -177,17 +178,17 @@ public class SQLDatabaseMetadata implements DatabaseMetaData {
 
     @Override
     public String getNumericFunctions() throws SQLException {
-        return "";
+        return StringUtils.toCsvList(EscapedFunctions.NumericFunction.values());
     }
 
     @Override
     public String getStringFunctions() throws SQLException {
-        return "";
+        return StringUtils.toCsvList(EscapedFunctions.StringFunction.values());
     }
 
     @Override
     public String getSystemFunctions() throws SQLException {
-        return "";
+        return StringUtils.toCsvList(EscapedFunctions.SystemFunction.values());
     }
 
     @Override
@@ -272,7 +273,7 @@ public class SQLDatabaseMetadata implements DatabaseMetaData {
 
     @Override
     public boolean supportsLikeEscapeClause() throws SQLException {
-        return false;
+        return true;
     }
 
     @Override

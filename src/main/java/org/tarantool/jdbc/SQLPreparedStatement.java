@@ -35,7 +35,7 @@ public class SQLPreparedStatement extends SQLStatement implements PreparedStatem
 
     public SQLPreparedStatement(SQLConnection connection, String sql) throws SQLException {
         super(connection);
-        this.sql = sql;
+        this.sql = translateQuery(sql);
         this.params = new HashMap<>();
     }
 
@@ -45,7 +45,7 @@ public class SQLPreparedStatement extends SQLStatement implements PreparedStatem
                                 int resultSetConcurrency,
                                 int resultSetHoldability) throws SQLException {
         super(connection, resultSetType, resultSetConcurrency, resultSetHoldability);
-        this.sql = sql;
+        this.sql = translateQuery(sql);
         this.params = new HashMap<>();
     }
 

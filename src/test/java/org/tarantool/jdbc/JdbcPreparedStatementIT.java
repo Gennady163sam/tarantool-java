@@ -322,6 +322,159 @@ public class JdbcPreparedStatementIT {
         assertEquals(-1, prep.getUpdateCount());
     }
 
+    @Test
+    public void testDisabledEscapeSyntax() throws Exception {
+        testHelper.executeSql("INSERT INTO test(id, val) VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')");
+
+        prep = conn.prepareStatement("SELECT val FROM test ORDER BY id {limit ?}");
+        prep.setEscapeProcessing(false);
+        prep.setInt(1, 1);
+
+        prep.execute();
+
+        try (ResultSet resultSet = prep.getResultSet()) {
+            assertTrue(resultSet.next());
+            assertEquals("one", resultSet.getString(1));
+            assertFalse(resultSet.next());
+        }
+
+    }
+
+    @Test
+    public void testLimitEscapeSyntax() throws Exception {
+        testHelper.executeSql("INSERT INTO test(id, val) VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')");
+
+        prep = conn.prepareStatement("SELECT val FROM test ORDER BY id {limit ? offset ?}");
+        prep.setInt(1, 2);
+        prep.setInt(2, 0);
+
+        prep.execute();
+
+        try (ResultSet resultSet = prep.getResultSet()) {
+            assertTrue(resultSet.next());
+            assertEquals("one", resultSet.getString(1));
+            assertTrue(resultSet.next());
+            assertEquals("two", resultSet.getString(1));
+            assertFalse(resultSet.next());
+        }
+    }
+
+    @Test
+    public void testLikeEscapeSyntax() throws Exception {
+        testHelper.executeSql("INSERT INTO test(id, val) VALUES (1, 'one%'), (2, 'two'), (3, 'three%'), (4, 'four')");
+
+        prep = conn.prepareStatement("SELECT val FROM test WHERE val LIKE '%|%' {escape ?}");
+        prep.setString(1, "|");
+
+        prep.execute();
+
+        try (ResultSet resultSet = prep.getResultSet()) {
+            assertTrue(resultSet.next());
+            assertEquals("one%", resultSet.getString(1));
+            assertTrue(resultSet.next());
+            assertEquals("three%", resultSet.getString(1));
+            assertFalse(resultSet.next());
+        }
+    }
+
+    @Test
+    public void testOuterJoinEscapeSyntax() throws Exception {
+        testHelper.executeSql("INSERT INTO test(id, val) VALUES (1, 'one')");
+
+        prep = conn.prepareStatement(
+            "SELECT {fn concat('t1-', t1.val)}, {fn concat('t2-', t2.val)} " +
+                "FROM {oj test t1 LEFT OUTER JOIN test t2 ON t1.id = ?}"
+        );
+        prep.setInt(1, 1);
+
+        prep.execute();
+
+        try (ResultSet resultSet = prep.getResultSet()) {
+            assertTrue(resultSet.next());
+            assertEquals("t1-one", resultSet.getString(1));
+            assertEquals("t2-one", resultSet.getString(2));
+            assertFalse(resultSet.next());
+        }
+    }
+
+    @Test
+    public void testSystemFunctionEscapeSyntax() throws Exception {
+        testHelper.executeSql("INSERT INTO test(id, val) VALUES (1, NULL)");
+
+        prep = conn.prepareStatement("SELECT {fn ifnull(val, ?)} FROM test WHERE id = 1");
+        prep.setString(1, "one-one");
+
+        prep.execute();
+
+        try (ResultSet resultSet = prep.getResultSet()) {
+            assertTrue(resultSet.next());
+            assertEquals("one-one", resultSet.getString(1));
+            assertFalse(resultSet.next());
+        }
+    }
+
+    @Test
+    public void testNumericFunctionEscapeSyntax() throws Exception {
+        testHelper.executeSql("INSERT INTO test(id, val) VALUES (1, NULL)");
+
+        prep = conn.prepareStatement("SELECT {fn abs(5 - ?)}, {fn round({fn pi()}, ?)}");
+        prep.setInt(1, 10);
+        prep.setInt(2, 0);
+
+        prep.execute();
+
+        try (ResultSet resultSet = prep.getResultSet()) {
+            assertTrue(resultSet.next());
+            assertEquals(5, resultSet.getInt(1));
+            assertEquals(3, resultSet.getInt(2));
+            assertFalse(resultSet.next());
+        }
+    }
+
+    @Test
+    public void testStringFunctionEscapeSyntax() throws Exception {
+        testHelper.executeSql("INSERT INTO test(id, val) VALUES (1, 'one'), (2, 'TWO'), (3, 'three'), (4, ' four ')");
+
+        prep = conn.prepareStatement(
+            "SELECT {fn char(?)}, {fn char_length(val)}, {fn concat(?, val)} FROM test WHERE id = 3"
+        );
+        prep.setInt(1, 0x20);
+        prep.setString(2, "3 ");
+
+        prep.execute();
+
+        try (ResultSet resultSet = prep.getResultSet()) {
+            assertTrue(resultSet.next());
+            assertEquals(" ", resultSet.getString(1));
+            assertEquals(5, resultSet.getInt(2));
+            assertEquals("3 three", resultSet.getString(3));
+            assertFalse(resultSet.next());
+        }
+        prep.close();
+
+        prep = conn.prepareStatement(
+            "SELECT {fn lcase(val)}, " +
+                "{fn left(val, ?)}, " +
+                "{fn replace({fn lcase(val)}, 'two', ?)}, " +
+                "{fn substring(val, ?, 2)} " +
+                "FROM test WHERE id = 2"
+        );
+        prep.setInt(1, 2);
+        prep.setString(2, "2");
+        prep.setInt(3, 1);
+
+        prep.execute();
+
+        try (ResultSet resultSet = prep.getResultSet()) {
+            assertTrue(resultSet.next());
+            assertEquals("two", resultSet.getString(1));
+            assertEquals("TW", resultSet.getString(2));
+            assertEquals("2", resultSet.getString(3));
+            assertEquals("TW", resultSet.getString(4));
+            assertFalse(resultSet.next());
+        }
+    }
+
     private List<?> consoleSelect(Object key) {
         List<?> list = testHelper.evaluate(TestUtils.toLuaSelect("TEST", key));
         return list == null ? Collections.emptyList() : (List<?>) list.get(0);

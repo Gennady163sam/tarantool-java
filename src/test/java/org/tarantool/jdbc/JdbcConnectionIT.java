@@ -26,6 +26,7 @@ import java.sql.ResultSet;
 import java.sql.SQLClientInfoException;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
+import java.sql.SQLSyntaxErrorException;
 import java.sql.Statement;
 import java.util.Map;
 
@@ -460,5 +461,177 @@ public class JdbcConnectionIT {
         assertEquals(ClientInfoStatus.REASON_UNKNOWN_PROPERTY, failedProperties.get(targetProperty));
     }
 
-}
+    @Test
+    void testLimitEscapeProcessing() throws SQLException {
+        String[][] expressions = {
+            { "select * from table {limit 10}", "select * from table limit 10" },
+            { "select * from table {limit 10 offset 20}", "select * from table limit 10 offset 20" },
+            {
+                "select * from table where val = 'val {limit 10}' {limit 15}",
+                "select * from table where val = 'val {limit 10}' limit 15"
+            },
+            { "select * from table {limit 10}", "select * from table limit 10" },
+            { "select * from table /*{limit 10}*/ {limit 25}", "select * from table /*{limit 10}*/ limit 25" },
+            { "select * from table {limit 25} -- {limit 45}", "select * from table limit 25 -- {limit 45}" },
+            { "select * from table -- {limit 45}\n{limit 10}", "select * from table -- {limit 45}\nlimit 10" },
+            { "select * from table {limit (10) offset (((20)))}", "select * from table limit (10) offset (((20)))" },
+            { "select * from table {limit {fn rand(531)}}", "select * from table limit RANDOM()" },
+        };
 
+        for (String[] pair : expressions) {
+            assertEquals(pair[1], conn.nativeSQL(pair[0]));
+        }
+    }
+
+    @Test
+    void testLikeEscapeProcessing() throws SQLException {
+        String[][] expressions = {
+            {
+                "select * from table where val like '|%type' {escape '|'}",
+                "select * from table where val like '|%type' escape '|'"
+            },
+            {
+                "select * from table where val like '|%type' -- {escape '|'}",
+                "select * from table where val like '|%type' -- {escape '|'}"
+            },
+            {
+                "select * from table where /* use {escape '&'} */ val like '|&type&&' {escape '&'}",
+                "select * from table where /* use {escape '&'} */ val like '|&type&&' escape '&'",
+            },
+            {
+                "select * from table where /* use {escape '&'} */ val like '|&type&&' {escape '&'}",
+                "select * from table where /* use {escape '&'} */ val like '|&type&&' escape '&'",
+            },
+            {
+                "select * from \"TABLE\" where val like '|&type&&' {escape {fn char(38)}}",
+                "select * from \"TABLE\" where val like '|&type&&' escape CHAR(38)",
+            }
+        };
+
+        for (String[] pair : expressions) {
+            assertEquals(pair[1], conn.nativeSQL(pair[0]));
+        }
+    }
+
+    @Test
+    void testOuterJoinEscapeProcessing() throws SQLException {
+        String[][] expressions = {
+            {
+                "select * from {oj table1 left outer join table2 on type = 4} {limit 5}",
+                "select * from table1 left outer join table2 on type = 4 limit 5",
+            },
+            {
+                "select * from /* {oj} */ {oj table1 left outer join table2 on type = 4} {limit 5}",
+                "select * from /* {oj} */ table1 left outer join table2 on type = 4 limit 5",
+            },
+            {
+                "select * from {oj t1 left outer join (select id from {oj t2 right outer join t3 on 1 = 1}) on id = 4}",
+                "select * from t1 left outer join (select id from t2 right outer join t3 on 1 = 1) on id = 4",
+            }
+        };
+
+        for (String[] pair : expressions) {
+            assertEquals(pair[1], conn.nativeSQL(pair[0]));
+        }
+    }
+
+    @Test
+    void testSystemFunctionsEscapeProcessing() throws SQLException {
+        String[][] expressions = {
+            { "select {fn database()}", "select 'DEFAULT'" },
+            { "select {fn user()}", "select 'test_admin'" },
+            { "select {fn ifnull(null, 'non null string')}", "select IFNULL(null, 'non null string')" },
+            { "select {fn ifnull({fn user()}, {fn database()})}", "select IFNULL('test_admin', 'DEFAULT')" }
+        };
+
+        for (String[] pair : expressions) {
+            assertEquals(pair[1], conn.nativeSQL(pair[0]));
+        }
+    }
+
+    @Test
+    void testNumericFunctionsEscapeProcessing() throws SQLException {
+        String[][] expressions = {
+            { "select {fn abs(-10)}", "select ABS(-10)" },
+            { "select {fn pi()}", "select 3.141592653589793" },
+            { "select {fn rand(903)}", "select RANDOM()" },
+            { "select {fn round(-3.14, 1)}", "select ROUND(-3.14, 1)" },
+            {
+                "select 2 * {fn pi()} * {fn pi()} / {fn abs({fn rand(252)} - {fn round({fn pi()}, 4)})}",
+                "select 2 * 3.141592653589793 * 3.141592653589793 / ABS(RANDOM() - ROUND(3.141592653589793, 4))"
+            }
+        };
+
+        for (String[] pair : expressions) {
+            assertEquals(pair[1], conn.nativeSQL(pair[0]));
+        }
+    }
+
+    @Test
+    void testStringFunctionsEscapeProcessing() throws SQLException {
+        String[][] expressions = {
+            { "select {fn char(32)}", "select CHAR(32)" },
+            { "select {fn char_length(val)}", "select CHAR_LENGTH(val)" },
+            { "select {fn character_length(val)}", "select CHARACTER_LENGTH(val)" },
+            { "select {fn concat('abc', '123')}", "select ('abc' || '123')" },
+            { "select {fn lcase('aBc')}", "select LOWER('aBc')" },
+            { "select {fn left('abcdfgh', 3)}", "select SUBSTR('abcdfgh', 1, 3)" },
+            { "select {fn length('value')}", "select LENGTH(TRIM(TRAILING FROM 'value'))" },
+            { "select {fn ltrim('  value')}", "select TRIM(LEADING FROM '  value')" },
+            { "select {fn replace('value', 'a', 'o')}", "select REPLACE('value', 'a', 'o')" },
+            { "select {fn right('value', 2)}", "select SUBSTR('value', LENGTH('value') - 2 + 1)" },
+            { "select {fn rtrim('value  ')}", "select TRIM(TRAILING FROM 'value  ')" },
+            { "select {fn soundex('one')}", "select SOUNDEX('one')" },
+            { "select {fn substring('value', 2, len)}", "select SUBSTR('value', 2, len)" },
+            { "select {fn ucase('value')}", "select UPPER('value')" },
+            {
+                "select {fn lcase({fn substring({fn concat('value', '12345')}, 1, {fn abs(num)})})}",
+                "select LOWER(SUBSTR(('value' || '12345'), 1, ABS(num)))"
+            }
+        };
+
+        for (String[] pair : expressions) {
+            assertEquals(pair[1], conn.nativeSQL(pair[0]));
+        }
+    }
+
+    @Test
+    void testNoFunctionsEscapeProcessing() throws SQLException {
+        String[] expressions = {
+            "select * from table /* {fn abs(-10)} */",
+            "select * from table",
+            "select 1 -- ping",
+            "select 3 -- {fn round(3.14, 0)}",
+            "select '{fn pi()}'"
+        };
+
+        for (
+            String expression : expressions) {
+            assertEquals(expression, conn.nativeSQL(expression));
+        }
+    }
+
+    @Test
+    void testWrongFunctionsEscapeProcessing() throws SQLException {
+        String[] expressions = {
+            "select {fn char(48)", // open escape expression
+            "select /* {fn char_length(val)}", // open block comment
+            "select {fn character_length('asd)}", // open string literal
+            "select }fn concat('abc', '123')}", // bad }
+            "select {fn lcase('aBc')}}", // extra }
+            "select * from \"TABLE where val = {fn left('abcdfgh', 3)}", // open quoted identifier
+            "select {fn ('value')}", // missed function name
+            "select {fn ltrim(('  value')}", // extra (
+            "select {fn 0replace('value', 'a', 'o')}", // wrong identifier
+            "select {fn right_part('value', 2)}", // unsupported/unknown function name
+            "select {comment 'your comment here'}", // unsupported escape syntax
+            "select {fn soundex('one', 3)}", // unsupported function signature (2 args)
+        };
+
+        for (String badExpression : expressions) {
+            System.out.println(badExpression);
+            assertThrows(SQLSyntaxErrorException.class, () -> conn.nativeSQL(badExpression));
+        }
+    }
+
+}

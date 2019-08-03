@@ -32,6 +32,7 @@ public class SQLStatement implements TarantoolStatement {
     protected int updateCount;
 
     private boolean isCloseOnCompletion;
+    private boolean useEscapeProcessing = true;
 
     private final int resultSetType;
     private final int resultSetConcurrency;
@@ -66,7 +67,7 @@ public class SQLStatement implements TarantoolStatement {
     @Override
     public ResultSet executeQuery(String sql) throws SQLException {
         checkNotClosed();
-        if (!executeInternal(sql)) {
+        if (!executeInternal(translateQuery(sql))) {
             throw new SQLException("No results were returned", SQLStates.NO_DATA.getSqlState());
         }
         return resultSet;
@@ -75,7 +76,7 @@ public class SQLStatement implements TarantoolStatement {
     @Override
     public int executeUpdate(String sql) throws SQLException {
         checkNotClosed();
-        if (executeInternal(sql)) {
+        if (executeInternal(translateQuery(sql))) {
             throw new SQLException(
                 "Result was returned but nothing was expected",
                 SQLStates.TOO_MANY_RESULTS.getSqlState()
@@ -139,7 +140,8 @@ public class SQLStatement implements TarantoolStatement {
 
     @Override
     public void setEscapeProcessing(boolean enable) throws SQLException {
-        throw new SQLFeatureNotSupportedException();
+        checkNotClosed();
+        useEscapeProcessing = enable;
     }
 
     @Override
@@ -181,7 +183,7 @@ public class SQLStatement implements TarantoolStatement {
     @Override
     public boolean execute(String sql) throws SQLException {
         checkNotClosed();
-        return executeInternal(sql);
+        return executeInternal(translateQuery(sql));
     }
 
     @Override
@@ -329,7 +331,7 @@ public class SQLStatement implements TarantoolStatement {
      * explicitly by the app.
      *
      * @throws SQLException if this method is called on a closed
-     * {@code Statement}
+     *                      {@code Statement}
      */
     @Override
     public void closeOnCompletion() throws SQLException {
@@ -423,6 +425,10 @@ public class SQLStatement implements TarantoolStatement {
         if (isClosed()) {
             throw new SQLNonTransientException("Statement is closed.");
         }
+    }
+
+    protected String translateQuery(String sql) throws SQLException {
+        return useEscapeProcessing ? connection.nativeSQL(sql) : sql;
     }
 
 }

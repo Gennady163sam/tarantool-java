@@ -23,8 +23,12 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 public class JdbcDatabaseMetaDataIT {
 
@@ -388,6 +392,39 @@ public class JdbcDatabaseMetaDataIT {
             assertFalse(meta.ownDeletesAreVisible(type));
             assertFalse(meta.deletesAreDetected(type));
         }
+    }
+
+    @Test
+    void testStringFunctionSupport() throws SQLException {
+        String[] systemFunctions = meta.getStringFunctions().split(",");
+        assertEquals(EscapedFunctions.StringFunction.values().length, systemFunctions.length);
+        Set<String> actualSet = new HashSet<>(Arrays.asList(systemFunctions));
+        Set<String> expectedSet = Arrays.stream(EscapedFunctions.StringFunction.values())
+            .map(Enum::toString)
+            .collect(Collectors.toSet());
+        assertEquals(expectedSet, actualSet);
+    }
+
+    @Test
+    void testNumericFunctionSupport() throws SQLException {
+        String[] systemFunctions = meta.getNumericFunctions().split(",");
+        assertEquals(EscapedFunctions.NumericFunction.values().length, systemFunctions.length);
+        Set<String> actualSet = new HashSet<>(Arrays.asList(systemFunctions));
+        Set<String> expectedSet = Arrays.stream(EscapedFunctions.NumericFunction.values())
+            .map(Enum::toString)
+            .collect(Collectors.toSet());
+        assertEquals(expectedSet, actualSet);
+    }
+
+    @Test
+    void testSystemFunctionSupport() throws SQLException {
+        String[] systemFunctions = meta.getSystemFunctions().split(",");
+        assertEquals(EscapedFunctions.SystemFunction.values().length, systemFunctions.length);
+        Set<String> actualSet = new HashSet<>(Arrays.asList(systemFunctions));
+        Set<String> expectedSet = Arrays.stream(EscapedFunctions.SystemFunction.values())
+            .map(Enum::toString)
+            .collect(Collectors.toSet());
+        assertEquals(expectedSet, actualSet);
     }
 
 }
