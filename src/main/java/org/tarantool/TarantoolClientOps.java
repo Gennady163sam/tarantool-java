@@ -1,5 +1,7 @@
 package org.tarantool;
 
+import org.tarantool.dsl.TarantoolRequestConvertible;
+
 public interface TarantoolClientOps<O, P, R> {
     R select(Integer space, Integer index, O key, int offset, int limit, int iterator);
 
@@ -33,7 +35,10 @@ public interface TarantoolClientOps<O, P, R> {
 
     R eval(String expression, Object... args);
 
+    R execute(TarantoolRequestConvertible requestSpec);
+
     void ping();
 
     void close();
+
 }
