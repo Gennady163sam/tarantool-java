@@ -256,7 +256,7 @@ public class TarantoolClientOpsIT {
         provider.close();
     }
 
-    private void checkReplace(TarantoolClientOps<Integer, List<?>, Object, List<?>> clientOps,
+    private void checkReplace(TarantoolClientOps<List<?>, Object, List<?>> clientOps,
                               String space,
                               int spaceId,
                               List key,
@@ -332,7 +332,7 @@ public class TarantoolClientOpsIT {
         provider.close();
     }
 
-    private void checkUpdate(TarantoolClientOps<Integer, List<?>, Object, List<?>> clientOps,
+    private void checkUpdate(TarantoolClientOps<List<?>, Object, List<?>> clientOps,
                              String space,
                              int spaceId,
                              List key,
@@ -391,7 +391,7 @@ public class TarantoolClientOpsIT {
         provider.close();
     }
 
-    private void checkUpsert(TarantoolClientOps<Integer, List<?>, Object, List<?>> clientOps,
+    private void checkUpsert(TarantoolClientOps<List<?>, Object, List<?>> clientOps,
                              String space,
                              int spaceId,
                              List key,
@@ -446,7 +446,7 @@ public class TarantoolClientOpsIT {
         provider.close();
     }
 
-    private void checkDelete(TarantoolClientOps<Integer, List<?>, Object, List<?>> clientOps,
+    private void checkDelete(TarantoolClientOps<List<?>, Object, List<?>> clientOps,
                              String space,
                              int spaceId,
                              List key,
@@ -580,12 +580,10 @@ public class TarantoolClientOpsIT {
     @MethodSource("getClientOps")
     public void testInsertDuplicateKey(SyncOpsProvider provider) {
         final List tup = Arrays.asList(1, "uno");
-        TarantoolException ex = assertThrows(TarantoolException.class, new Executable() {
-            @Override
-            public void execute() throws Throwable {
-                provider.getClientOps().insert(spaceId, tup);
-            }
-        });
+        TarantoolException ex = assertThrows(
+            TarantoolException.class,
+            () -> provider.getClientOps().insert(spaceId, tup)
+        );
         assertEquals("Duplicate key exists in unique index 'pk' in space 'basic_test'", ex.getMessage());
 
         // Check the tuple stayed intact.
@@ -663,7 +661,7 @@ public class TarantoolClientOpsIT {
     }
 
     private interface SyncOpsProvider {
-        TarantoolClientOps<Integer, List<?>, Object, List<?>> getClientOps();
+        TarantoolClientOps<List<?>, Object, List<?>> getClientOps();
 
         void close();
     }
@@ -673,7 +671,7 @@ public class TarantoolClientOpsIT {
         private TarantoolClient client = makeTestClient(makeDefaultClientConfig(), RESTART_TIMEOUT);
 
         @Override
-        public TarantoolClientOps<Integer, List<?>, Object, List<?>> getClientOps() {
+        public TarantoolClientOps<List<?>, Object, List<?>> getClientOps() {
             return client.syncOps();
         }
 
@@ -689,7 +687,7 @@ public class TarantoolClientOpsIT {
         private TarantoolConnection connection = makeConnection();
 
         @Override
-        public TarantoolClientOps<Integer, List<?>, Object, List<?>> getClientOps() {
+        public TarantoolClientOps<List<?>, Object, List<?>> getClientOps() {
             return connection;
         }
 

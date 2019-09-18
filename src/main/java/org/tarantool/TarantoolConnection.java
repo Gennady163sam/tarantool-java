@@ -2,6 +2,7 @@ package org.tarantool;
 
 import org.tarantool.protocol.ProtoUtils;
 import org.tarantool.protocol.TarantoolPacket;
+import org.tarantool.schema.TarantoolSchemaMeta;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -27,9 +28,15 @@ public class TarantoolConnection extends TarantoolBase<List<?>>
     }
 
     @Override
-    protected List<?> exec(Code code, Object... args) {
-        TarantoolPacket responsePacket = writeAndRead(code, args);
+    protected List<?> exec(TarantoolRequest request) {
+        Object[] args = request.getArguments().toArray();
+        TarantoolPacket responsePacket = writeAndRead(request.getCode(), args);
         return (List) responsePacket.getBody().get(Key.DATA.getId());
+    }
+
+    @Override
+    protected TarantoolSchemaMeta getSchemaMeta() {
+        return null;
     }
 
     protected TarantoolPacket writeAndRead(Code code, Object... args) {
@@ -44,7 +51,7 @@ public class TarantoolConnection extends TarantoolBase<List<?>>
 
             Long c = responsePacket.getCode();
             if (c != 0) {
-                throw serverError(c, responsePacket.getBody().get(Key.ERROR.getId()));
+                throw serverError(c, responsePacket.getError());
             }
 
             return responsePacket;

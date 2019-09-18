@@ -1,5 +1,7 @@
 package org.tarantool;
 
+import org.tarantool.util.TupleTwo;
+
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -226,6 +228,11 @@ public class MsgPackLite {
                 pack(kvp.getKey(), out);
                 pack(kvp.getValue(), out);
             }
+        } else if (item instanceof TupleTwo) {
+            TupleTwo<?, ?> tuple = (TupleTwo<?, ?>) item;
+            out.write(1 | MP_FIXMAP);
+            pack(tuple.getFirst(), out);
+            pack(tuple.getSecond(), out);
         } else {
             throw new IllegalArgumentException("Cannot msgpack object of type " + item.getClass().getCanonicalName());
         }

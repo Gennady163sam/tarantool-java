@@ -14,7 +14,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.StampedLock;
 
@@ -35,14 +34,13 @@ public class TarantoolClusterClient extends TarantoolClientImpl {
     /**
      * Discovery activity.
      */
-    private ScheduledExecutorService instancesDiscoveryExecutor;
     private Runnable instancesDiscovererTask;
     private StampedLock discoveryLock = new StampedLock();
 
     /**
      * Collection of operations to be retried.
      */
-    private ConcurrentHashMap<Long, TarantoolOp<?>> retries = new ConcurrentHashMap<>();
+    private ConcurrentHashMap<Long, TarantoolRequest> retries = new ConcurrentHashMap<>();
 
     /**
      * Constructs a new cluster client.
@@ -70,14 +68,12 @@ public class TarantoolClusterClient extends TarantoolClientImpl {
         if (StringUtils.isNotBlank(config.clusterDiscoveryEntryFunction)) {
             this.instancesDiscovererTask =
                 createDiscoveryTask(new TarantoolClusterStoredFunctionDiscoverer(config, this));
-            this.instancesDiscoveryExecutor
-                = Executors.newSingleThreadScheduledExecutor(new TarantoolThreadDaemonFactory("tarantoolDiscoverer"));
             int delay = config.clusterDiscoveryDelayMillis > 0
                 ? config.clusterDiscoveryDelayMillis
                 : TarantoolClusterClientConfig.DEFAULT_CLUSTER_DISCOVERY_DELAY_MILLIS;
 
             // todo: it's better to start a job later (out of ctor)
-            this.instancesDiscoveryExecutor.scheduleWithFixedDelay(
+            this.workExecutor.scheduleWithFixedDelay(
                 this.instancesDiscovererTask,
                 0,
                 delay,
@@ -87,24 +83,16 @@ public class TarantoolClusterClient extends TarantoolClientImpl {
     }
 
     @Override
-    protected boolean isDead(TarantoolOp<?> future) {
+    protected boolean isDead(TarantoolRequest request) {
         if ((state.getState() & StateHelper.CLOSED) != 0) {
-            future.completeExceptionally(new CommunicationException("Connection is dead", thumbstone));
+            request.getResult().completeExceptionally(new CommunicationException("Connection is dead", thumbstone));
             return true;
         }
         Exception err = thumbstone;
         if (err != null) {
-            return checkFail(future, err);
+            return checkFail(request, err);
         }
         return false;
-    }
-
-    @Override
-    protected TarantoolOp<?> doExec(long timeoutMillis, Code code, Object[] args) {
-        validateArgs(args);
-        long sid = syncId.incrementAndGet();
-        TarantoolOp<?> future = makeNewOperation(timeoutMillis, sid, code, args);
-        return registerOperation(future);
     }
 
     /**
@@ -112,47 +100,32 @@ public class TarantoolClusterClient extends TarantoolClientImpl {
      * Registration is discovery-aware in term of synchronization and
      * it may be blocked util the discovery finishes its work.
      *
-     * @param future operation to be performed
+     * @param request operation to be performed
      *
      * @return registered operation
      */
-    private TarantoolOp<?> registerOperation(TarantoolOp<?> future) {
+    @Override
+    protected TarantoolRequest registerOperation(TarantoolRequest request, long schemaId) {
         long stamp = discoveryLock.readLock();
         try {
-            if (isDead(future)) {
-                return future;
-            }
-            futures.put(future.getId(), future);
-            if (isDead(future)) {
-                futures.remove(future.getId());
-                return future;
-            }
-
-            try {
-                write(future.getCode(), future.getId(), null, future.getArgs());
-            } catch (Exception e) {
-                futures.remove(future.getId());
-                fail(future, e);
-            }
-
-            return future;
+            return super.registerOperation(request, schemaId);
         } finally {
             discoveryLock.unlock(stamp);
         }
     }
 
     @Override
-    protected void fail(TarantoolOp<?> future, Exception e) {
-        checkFail(future, e);
+    protected void fail(TarantoolRequest request, Exception e) {
+        checkFail(request, e);
     }
 
-    protected boolean checkFail(TarantoolOp<?> future, Exception e) {
+    protected boolean checkFail(TarantoolRequest request, Exception e) {
         if (!isTransientError(e)) {
-            future.completeExceptionally(e);
+            request.getResult().completeExceptionally(e);
             return true;
         } else {
             assert retries != null;
-            retries.put(future.getId(), future);
+            retries.put(request.getId(), request);
             return false;
         }
     }
@@ -161,17 +134,13 @@ public class TarantoolClusterClient extends TarantoolClientImpl {
     protected void close(Exception e) {
         super.close(e);
 
-        if (instancesDiscoveryExecutor != null) {
-            instancesDiscoveryExecutor.shutdownNow();
-        }
-
         if (retries == null) {
             // May happen within constructor.
             return;
         }
 
-        for (TarantoolOp<?> op : retries.values()) {
-            op.completeExceptionally(e);
+        for (TarantoolRequest request : retries.values()) {
+            request.getResult().completeExceptionally(e);
         }
     }
 
@@ -194,18 +163,18 @@ public class TarantoolClusterClient extends TarantoolClientImpl {
             // First call is before the constructor finished. Skip it.
             return;
         }
-        Collection<TarantoolOp<?>> futuresToRetry = new ArrayList<>(retries.values());
+        Collection<TarantoolRequest> futuresToRetry = new ArrayList<>(retries.values());
         retries.clear();
-        for (final TarantoolOp<?> future : futuresToRetry) {
-            if (!future.isDone()) {
-                executor.execute(() -> registerOperation(future));
+        for (final TarantoolRequest request : futuresToRetry) {
+            if (!request.getResult().isDone()) {
+                executor.execute(() -> registerOperation(request, schemaMeta.getSchemaVersion()));
             }
         }
     }
 
     @Override
-    protected void complete(TarantoolPacket packet, TarantoolOp<?> future) {
-        super.complete(packet, future);
+    protected void complete(TarantoolPacket packet, TarantoolRequest request) {
+        super.complete(packet, request);
         RefreshableSocketProvider provider = getRefreshableSocketProvider();
         if (provider != null) {
             renewConnectionIfRequired(provider.getAddresses());
@@ -278,7 +247,6 @@ public class TarantoolClusterClient extends TarantoolClientImpl {
                         onInstancesRefreshed(lastInstances);
                     }
                 } catch (Exception ignored) {
-                    ignored.getCause();
                     // no-op
                 }
             }

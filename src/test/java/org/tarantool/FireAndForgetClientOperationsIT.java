@@ -91,12 +91,12 @@ public class FireAndForgetClientOperationsIT {
 
     @Test
     public void testFireAndForgetOperations() {
-        TarantoolClientOps<Integer, List<?>, Object, Long> ffOps = client.fireAndForgetOps();
+        TarantoolClientOps<List<?>, Object, Long> ffOps = client.fireAndForgetOps();
 
-        Set<Long> syncIds = new HashSet<Long>();
+        Set<Long> syncIds = new HashSet<>();
 
-        syncIds.add(ffOps.insert(spaceId, Arrays.asList(10, "10")));
-        syncIds.add(ffOps.delete(spaceId, Collections.singletonList(10)));
+        syncIds.add(ffOps.insert(spaceId, Arrays.asList(1, "1")));
+        syncIds.add(ffOps.delete(spaceId, Collections.singletonList(1)));
 
         syncIds.add(ffOps.insert(spaceId, Arrays.asList(10, "10")));
         syncIds.add(ffOps.update(spaceId, Collections.singletonList(10), Arrays.asList("=", 1, "ten")));
@@ -117,9 +117,39 @@ public class FireAndForgetClientOperationsIT {
         client.syncOps().ping();
 
         // Check the effects
+        assertEquals(consoleSelect(SPACE_NAME, 1), Collections.emptyList());
         checkRawTupleResult(consoleSelect(SPACE_NAME, 10), Arrays.asList(10, "ten"));
         checkRawTupleResult(consoleSelect(SPACE_NAME, 20), Arrays.asList(20, "twenty"));
-        assertEquals(consoleSelect(SPACE_NAME, 30), Collections.emptyList());
+        assertEquals(Collections.emptyList(), consoleSelect(SPACE_NAME, 30));
+    }
+
+    @Test
+    public void testFireAndForgetStringOperations() {
+        TarantoolClientOps<List<?>, Object, Long> ffOps = client.fireAndForgetOps();
+
+        Set<Long> syncIds = new HashSet<>();
+
+        syncIds.add(ffOps.insert(SPACE_NAME, Arrays.asList(2, "2")));
+        syncIds.add(ffOps.insert(SPACE_NAME, Arrays.asList(20, "20")));
+        syncIds.add(ffOps.replace(SPACE_NAME, Arrays.asList(200, "200")));
+
+        syncIds.add(ffOps.delete(SPACE_NAME, Collections.singletonList(2)));
+        syncIds.add(ffOps.update(SPACE_NAME, Collections.singletonList(20), Arrays.asList("=", 1, "twenty")));
+        syncIds.add(ffOps.upsert(SPACE_NAME, Collections.singletonList(200), Arrays.asList(200, "two hundred"),
+            Arrays.asList("=", 1, "two hundred")));
+
+        // Check the syncs.
+        assertFalse(syncIds.contains(0L));
+        assertEquals(6, syncIds.size());
+
+        // The reply for synchronous ping will
+        // indicate to us that previous fire & forget operations are completed.
+        client.syncOps().ping();
+
+        // Check the effects
+        assertEquals(consoleSelect(SPACE_NAME, 2), Collections.emptyList());
+        checkRawTupleResult(consoleSelect(SPACE_NAME, 20), Arrays.asList(20, "twenty"));
+        checkRawTupleResult(consoleSelect(SPACE_NAME, 200), Arrays.asList(200, "two hundred"));
     }
 
     private List<?> consoleSelect(String spaceName, Object key) {

@@ -2,6 +2,7 @@ package org.tarantool;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.tarantool.TestUtils.makeDefaultClusterClientConfig;
 import static org.tarantool.TestUtils.makeDiscoveryFunction;
 
@@ -20,7 +21,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Phaser;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -120,7 +121,7 @@ public class ClientReconnectClusterIT {
         String service1Address = "localhost:" + PORTS[0];
         String service2Address = "127.0.0.1:" + PORTS[1];
 
-        CyclicBarrier barrier = new CyclicBarrier(2);
+        Phaser phaser = new Phaser(1);
 
         String infoFunctionName = "getAddresses";
         String infoFunctionScript =
@@ -131,7 +132,7 @@ public class ClientReconnectClusterIT {
         final TarantoolClusterClient client = makeClientWithDiscoveryFeature(
             infoFunctionName,
             0,
-            (ignored) -> tryAwait(barrier),
+            (ignored) -> phaser.arrive(),
             service1Address
         );
 
@@ -139,7 +140,7 @@ public class ClientReconnectClusterIT {
         final int spaceId = ids[0];
         final int pkId = ids[1];
 
-        tryAwait(barrier); // client = { srv1 }; wait for { srv1, srv2 }
+        tryAwait(phaser, 0); // client = { srv1 }; wait for { srv1, srv2 }
 
         expectConnected(client, spaceId, pkId);
 
@@ -165,7 +166,7 @@ public class ClientReconnectClusterIT {
         String service1Address = "localhost:" + PORTS[0];
         String service2Address = "127.0.0.1:" + PORTS[1];
 
-        CyclicBarrier barrier = new CyclicBarrier(2);
+        Phaser phaser = new Phaser(1);
 
         String infoFunctionName = "getAddresses";
         String infoFunctionScript = makeDiscoveryFunction(infoFunctionName, Collections.singletonList(service1Address));
@@ -175,7 +176,7 @@ public class ClientReconnectClusterIT {
         final TarantoolClusterClient client = makeClientWithDiscoveryFeature(
             infoFunctionName,
             0,
-            (ignored) -> tryAwait(barrier),
+            (ignored) -> phaser.arrive(),
             service1Address,
             service2Address
         );
@@ -184,7 +185,7 @@ public class ClientReconnectClusterIT {
         final int spaceId = ids[0];
         final int pkId = ids[1];
 
-        tryAwait(barrier); // client = { srv1, srv2 }; wait for { srv1 }
+        tryAwait(phaser, 0); // client = { srv1, srv2 }; wait for { srv1 }
 
         expectConnected(client, spaceId, pkId);
 
@@ -349,7 +350,7 @@ public class ClientReconnectClusterIT {
         String service2Address = "127.0.0.1:" + PORTS[1];
         String service3Address = "localhost:" + PORTS[2];
 
-        CyclicBarrier barrier = new CyclicBarrier(2);
+        Phaser phaser = new Phaser(1);
 
         String infoFunctionName = "getAddressesFunction";
         String functionBody = Stream.of(service1Address, service2Address)
@@ -367,7 +368,7 @@ public class ClientReconnectClusterIT {
         final TarantoolClusterClient client = makeClientWithDiscoveryFeature(
             infoFunctionName,
             3000,
-            (ignored) -> tryAwait(barrier),
+            (ignored) -> phaser.arrive(),
             service1Address
         );
 
@@ -375,16 +376,16 @@ public class ClientReconnectClusterIT {
         final int spaceId = ids[0];
         final int pkId = ids[1];
 
-        tryAwait(barrier); // client = { srv1 }; wait for { srv1 }
+        tryAwait(phaser, 0); // client = { srv1 }; wait for { srv1 }
 
         expectConnected(client, spaceId, pkId);
 
-        tryAwait(barrier); // client = { srv1 }; wait for { srv2 }
+        tryAwait(phaser, 1); // client = { srv1 }; wait for { srv2 }
 
         stopInstancesAndAwait(SRV1);
         expectConnected(client, spaceId, pkId);
 
-        tryAwait(barrier); // client = { srv2 }; wait for { srv3 }
+        tryAwait(phaser, 2); // client = { srv2 }; wait for { srv3 }
 
         stopInstancesAndAwait(SRV2);
         expectConnected(client, spaceId, pkId);
@@ -393,11 +394,11 @@ public class ClientReconnectClusterIT {
         expectDisconnected(client, spaceId, pkId);
     }
 
-    private void tryAwait(CyclicBarrier barrier) {
+    private void tryAwait(Phaser phaser, int phase) {
         try {
-            barrier.await(6000, TimeUnit.MILLISECONDS);
+            phaser.awaitAdvanceInterruptibly(phase, 6000, TimeUnit.MILLISECONDS);
         } catch (Throwable e) {
-            e.printStackTrace();
+            fail(e);
         }
     }
 
@@ -459,6 +460,7 @@ public class ClientReconnectClusterIT {
                                                                   Consumer<Set<String>> consumer,
                                                                   String... addresses) {
         TarantoolClusterClientConfig config = makeDefaultClusterClientConfig();
+        config.operationExpiryTimeMillis = 3000;
         config.clusterDiscoveryEntryFunction = entryFunction;
         config.clusterDiscoveryDelayMillis = entryDelayMillis;
 

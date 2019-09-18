@@ -1,30 +1,38 @@
 package org.tarantool;
 
+import org.tarantool.protocol.ProtoConstants;
 import org.tarantool.protocol.ProtoUtils;
 import org.tarantool.protocol.ReadableViaSelectorChannel;
 import org.tarantool.protocol.TarantoolGreeting;
 import org.tarantool.protocol.TarantoolPacket;
+import org.tarantool.schema.TarantoolMetaSpacesCache;
+import org.tarantool.schema.TarantoolSchemaMeta;
+import org.tarantool.util.TupleTwo;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.StampedLock;
 
 public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements TarantoolClient {
 
@@ -32,7 +40,7 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         = new CommunicationException("Not connected, initializing connection");
 
     protected TarantoolClientConfig config;
-    protected long operationTimeout;
+    protected Duration operationTimeout;
 
     /**
      * External.
@@ -43,7 +51,12 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
 
     protected volatile Exception thumbstone;
 
-    protected Map<Long, TarantoolOp<?>> futures;
+    protected ScheduledExecutorService workExecutor;
+
+    protected StampedLock schemaLock = new StampedLock();
+    protected BlockingQueue<TarantoolRequest> delayedOpsQueue;
+
+    protected Map<Long, TarantoolRequest> futures;
     protected AtomicInteger pendingResponsesCount = new AtomicInteger();
 
     /**
@@ -63,6 +76,7 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
     protected SyncOps syncOps;
     protected FireAndForgetOps fireAndForgetOps;
     protected ComposableAsyncOps composableAsyncOps;
+    protected UnsafeSchemaOps unsafeSchemaOps;
 
     /**
      * Inner.
@@ -71,6 +85,8 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
     protected StateHelper state = new StateHelper(StateHelper.RECONNECT);
     protected Thread reader;
     protected Thread writer;
+
+    protected TarantoolSchemaMeta schemaMeta = new TarantoolMetaSpacesCache(this);
 
     protected Thread connector = new Thread(new Runnable() {
         @Override
@@ -104,10 +120,13 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         this.thumbstone = NOT_INIT_EXCEPTION;
         this.config = config;
         this.initialRequestSize = config.defaultRequestSize;
-        this.operationTimeout = config.operationExpiryTimeMillis;
+        this.operationTimeout = Duration.ofMillis(config.operationExpiryTimeMillis);
         this.socketProvider = socketProvider;
         this.stats = new TarantoolClientStats();
         this.futures = new ConcurrentHashMap<>(config.predictedFutures);
+        this.delayedOpsQueue = new PriorityBlockingQueue<>(128);
+        this.workExecutor =
+            Executors.newSingleThreadScheduledExecutor(new TarantoolThreadDaemonFactory("tarantool-worker"));
         this.sharedBuffer = ByteBuffer.allocateDirect(config.sharedBufferSize);
         this.writerBuffer = ByteBuffer.allocateDirect(sharedBuffer.capacity());
         this.connector.setDaemon(true);
@@ -115,6 +134,7 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         this.syncOps = new SyncOps();
         this.composableAsyncOps = new ComposableAsyncOps();
         this.fireAndForgetOps = new FireAndForgetOps();
+        this.unsafeSchemaOps = new UnsafeSchemaOps();
         if (!config.useNewCall) {
             setCallCode(Code.OLD_CALL);
             this.syncOps.setCallCode(Code.OLD_CALL);
@@ -192,6 +212,7 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         }
         this.thumbstone = null;
         startThreads(channel.socket().getRemoteSocketAddress().toString());
+        updateSchema();
     }
 
     protected void startThreads(String threadName) throws InterruptedException {
@@ -203,7 +224,7 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
                 try {
                     readThread();
                 } finally {
-                    state.release(StateHelper.READING);
+                    state.release(StateHelper.READING | StateHelper.SCHEMA_UPDATING);
                     // only last of two IO-threads can signal for reconnection
                     if (leftIoThreads.decrementAndGet() == 0) {
                         state.trySignalForReconnection();
@@ -217,7 +238,7 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
                 try {
                     writeThread();
                 } finally {
-                    state.release(StateHelper.WRITING);
+                    state.release(StateHelper.WRITING | StateHelper.SCHEMA_UPDATING);
                     // only last of two IO-threads can signal for reconnection
                     if (leftIoThreads.decrementAndGet() == 0) {
                         state.trySignalForReconnection();
@@ -240,60 +261,76 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         reader.setPriority(config.readerThreadPriority);
     }
 
+    @Override
+    public TarantoolSchemaMeta getSchemaMeta() {
+        return schemaMeta;
+    }
+
     /**
      * Executes an operation with default timeout.
      *
-     * @param code operation code
-     * @param args operation arguments
+     * @param request operation data
      *
      * @return deferred result
      *
      * @see #setOperationTimeout(long)
      */
-    protected Future<?> exec(Code code, Object... args) {
-        return doExec(operationTimeout, code, args);
+    @Override
+    protected Future<?> exec(TarantoolRequest request) {
+        return doExec(request).getResult();
+    }
+
+    protected TarantoolRequest doExec(TarantoolRequest request) {
+        long stamp = schemaLock.readLock();
+        try {
+            // space or index names could not be found in cache
+            // it's possible the client keeps the outdated schema
+            request.begin(syncId.incrementAndGet(), operationTimeout);
+            if (!request.isSerializable()) {
+                delayedOpsQueue.add(request);
+                // the schema is not ready, skip sync-op
+                if (isSchemaLoaded()) {
+                    optimisticSchemaUpdate(request);
+                }
+                return request;
+            }
+            // postpone operation if the schema is not ready
+            if (!isSchemaLoaded()) {
+                delayedOpsQueue.add(request);
+                return request;
+            }
+            return registerOperation(request, schemaMeta.getSchemaVersion());
+        } finally {
+            schemaLock.unlockRead(stamp);
+        }
     }
 
     /**
-     * Executes an operation with the given timeout.
-     * {@code timeoutMillis} will override the default
-     * timeout. 0 means the limitless operation.
+     * Checks whether the schema is fully cached.
      *
-     * @param code operation code
-     * @param args operation arguments
-     *
-     * @return deferred result
+     * @return {@literal true} if the schema is loaded
      */
-    protected Future<?> exec(long timeoutMillis, Code code, Object... args) {
-        return doExec(timeoutMillis, code, args);
+    private boolean isSchemaLoaded() {
+        return schemaMeta.isInitialized() && !state.isStateSet(StateHelper.SCHEMA_UPDATING);
     }
 
-    protected TarantoolOp<?> doExec(long timeoutMillis, Code code, Object[] args) {
-        validateArgs(args);
-        long sid = syncId.incrementAndGet();
-
-        TarantoolOp<?> future = makeNewOperation(timeoutMillis, sid, code, args);
-
-        if (isDead(future)) {
-            return future;
+    protected TarantoolRequest registerOperation(TarantoolRequest request, long schemaId) {
+        if (isDead(request)) {
+            return request;
         }
-        futures.put(sid, future);
-        if (isDead(future)) {
-            futures.remove(sid);
-            return future;
+        futures.put(request.getId(), request);
+        if (isDead(request)) {
+            futures.remove(request.getId());
+            return request;
         }
         try {
-            write(code, sid, null, args);
+            request.setStartedSchemaId(schemaId);
+            write(request.getCode(), request.getId(), schemaId, request.getArguments().toArray());
         } catch (Exception e) {
-            futures.remove(sid);
-            fail(future, e);
+            futures.remove(request.getId());
+            fail(request, e);
         }
-        return future;
-    }
-
-    protected TarantoolOp<?> makeNewOperation(long timeoutMillis, long sid, Code code, Object[] args) {
-        return new TarantoolOp<>(sid, code, args)
-            .orTimeout(timeoutMillis, TimeUnit.MILLISECONDS);
+        return request;
     }
 
     protected synchronized void die(String message, Exception cause) {
@@ -303,16 +340,22 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         final CommunicationException error = new CommunicationException(message, cause);
         this.thumbstone = error;
         while (!futures.isEmpty()) {
-            Iterator<Map.Entry<Long, TarantoolOp<?>>> iterator = futures.entrySet().iterator();
+            Iterator<Map.Entry<Long, TarantoolRequest>> iterator = futures.entrySet().iterator();
             while (iterator.hasNext()) {
-                Map.Entry<Long, TarantoolOp<?>> elem = iterator.next();
+                Map.Entry<Long, TarantoolRequest> elem = iterator.next();
                 if (elem != null) {
-                    TarantoolOp<?> future = elem.getValue();
-                    fail(future, error);
+                    TarantoolRequest request = elem.getValue();
+                    fail(request, error);
                 }
                 iterator.remove();
             }
         }
+
+        TarantoolRequest request;
+        while ((request = delayedOpsQueue.poll()) != null) {
+            fail(request, error);
+        }
+
         pendingResponsesCount.set(0);
 
         bufferLock.lock();
@@ -325,8 +368,9 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         stopIO();
     }
 
+    @Override
     public void ping() {
-        syncGet(exec(Code.PING));
+        syncGet(exec(new TarantoolRequest(Code.PING)));
     }
 
     protected void write(Code code, Long syncId, Long schemaId, Object... args)
@@ -418,10 +462,10 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
                 Map<Integer, Object> headers = packet.getHeaders();
 
                 Long syncId = (Long) headers.get(Key.SYNC.getId());
-                TarantoolOp<?> future = futures.remove(syncId);
+                TarantoolRequest request = futures.remove(syncId);
                 stats.received++;
                 pendingResponsesCount.decrementAndGet();
-                complete(packet, future);
+                complete(packet, request);
             } catch (Exception e) {
                 die("Cant read answer", e);
                 return;
@@ -461,33 +505,142 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         }
     }
 
-    protected void fail(TarantoolOp<?> future, Exception e) {
-        future.completeExceptionally(e);
+    protected void fail(TarantoolRequest request, Exception e) {
+        request.getResult().completeExceptionally(e);
     }
 
-    protected void complete(TarantoolPacket packet, TarantoolOp<?> future) {
-        if (future != null) {
-            long code = packet.getCode();
-            if (code == 0) {
-                if (future.getCode() == Code.EXECUTE) {
-                    completeSql(future, packet);
-                } else {
-                    ((TarantoolOp) future).complete(packet.getBody().get(Key.DATA.getId()));
-                }
+    protected void complete(TarantoolPacket packet, TarantoolRequest request) {
+        TarantoolOp<?> result = request.getResult();
+        if (result.isDone()) {
+            return;
+        }
+
+        long code = packet.getCode();
+        long schemaId = packet.getSchemaId();
+        if (code == ProtoConstants.SUCCESS) {
+            request.setCompletedSchemaId(schemaId);
+            if (request.isSync()) {
+                completeSync(request);
+            } else if (request.getCode() == Code.EXECUTE) {
+                completeSql(request, packet);
             } else {
-                Object error = packet.getBody().get(Key.ERROR.getId());
-                fail(future, serverError(code, error));
+                ((TarantoolOp) result).complete(packet.getData());
+            }
+        } else if (code == ProtoConstants.ERR_WRONG_SCHEMA_VERSION) {
+            if (schemaId > schemaMeta.getSchemaVersion()) {
+                delayedOpsQueue.add(request);
+            } else {
+                registerOperation(request, schemaMeta.getSchemaVersion());
+            }
+        } else {
+            Object error = packet.getError();
+            fail(request, serverError(code, error));
+        }
+
+        if (request.getStartedSchemaId() == 0) {
+            return;
+        }
+        // it's possible to receive bigger version than current
+        // i.e. after DDL operation or wrong schema version response
+        if (schemaId > schemaMeta.getSchemaVersion()) {
+            updateSchema();
+        }
+    }
+
+    /**
+     * When a sync is successful it's required
+     * to re-evaluate dependent request and complete
+     * exceptionally with a proper error.
+     *
+     * @param request sync request
+     */
+    private void completeSync(TarantoolRequest request) {
+        TarantoolRequest source = request.getSyncDependent();
+        if (delayedOpsQueue.remove(source)) {
+            try {
+                source.getArguments();
+            } catch (Exception e) {
+                fail(source, e);
             }
         }
     }
 
-    protected void completeSql(TarantoolOp<?> future, TarantoolPacket pack) {
+    /**
+     * Optimistic means the client issues ping request
+     * to check whether it keeps an actual schema version or not.
+     * If the schema is outdated, client uses refreshes its schema
+     * cache.
+     * <p>
+     * It's suitable when we don't refresh all the cache directly because
+     * of the schema can be large enough to be loaded fast.
+     *
+     * @see #updateSchema()
+     */
+    private void optimisticSchemaUpdate(TarantoolRequest source) {
+        TarantoolRequest pingRequest = new TarantoolRequest(Code.PING);
+        pingRequest.beginSync(syncId.incrementAndGet(), operationTimeout, source);
+        registerOperation(pingRequest, schemaMeta.getSchemaVersion());
+    }
+
+    private void updateSchema() {
+        performSchemaAction(() -> {
+            if (state.acquire(StateHelper.SCHEMA_UPDATING)) {
+                workExecutor.execute(createUpdateSchemaTask());
+            }
+        });
+    }
+
+    private Runnable createUpdateSchemaTask() {
+        return () -> {
+            try {
+                schemaMeta.refresh();
+            } catch (Exception cause) {
+                workExecutor.schedule(createUpdateSchemaTask(), 300L, TimeUnit.MILLISECONDS);
+                return;
+            }
+            performSchemaAction(() -> {
+                try {
+                    rescheduleDelayedOperations();
+                } finally {
+                    state.release(StateHelper.SCHEMA_UPDATING);
+                }
+            });
+        };
+    }
+
+    private void rescheduleDelayedOperations() {
+        TarantoolRequest request;
+        while ((request = delayedOpsQueue.poll()) != null) {
+            TarantoolOp<?> op = request.getResult();
+            if (!op.isDone()) {
+                registerOperation(request, schemaMeta.getSchemaVersion());
+            }
+        }
+    }
+
+    protected void completeSql(TarantoolRequest request, TarantoolPacket pack) {
         Long rowCount = SqlProtoUtils.getSQLRowCount(pack);
+        TarantoolOp<?> result = request.getResult();
         if (rowCount != null) {
-            ((TarantoolOp) future).complete(rowCount);
+            ((TarantoolOp) result).complete(rowCount);
         } else {
             List<Map<String, Object>> values = SqlProtoUtils.readSqlResult(pack);
-            ((TarantoolOp) future).complete(values);
+            ((TarantoolOp) result).complete(values);
+        }
+    }
+
+    /**
+     * Convenient guard scope that executes given runnable
+     * inside schema write lock.
+     *
+     * @param action to be executed
+     */
+    protected void performSchemaAction(Runnable action) {
+        long stamp = schemaLock.writeLock();
+        try {
+            action.run();
+        } finally {
+            schemaLock.unlockWrite(stamp);
         }
     }
 
@@ -523,6 +676,9 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
 
     protected void close(Exception e) {
         if (state.close()) {
+            if (workExecutor != null) {
+                workExecutor.shutdownNow();
+            }
             connector.interrupt();
             die(e.getMessage(), e);
         }
@@ -551,7 +707,7 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
      * @return timeout in millis
      */
     public long getOperationTimeout() {
-        return operationTimeout;
+        return operationTimeout.toMillis();
     }
 
     /**
@@ -560,17 +716,17 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
      * @param operationTimeout timeout in millis
      */
     public void setOperationTimeout(long operationTimeout) {
-        this.operationTimeout = operationTimeout;
+        this.operationTimeout = Duration.ofMillis(operationTimeout);
     }
 
     @Override
     public boolean isAlive() {
-        return state.getState() == StateHelper.ALIVE && thumbstone == null;
+        return state.isStateSet(StateHelper.ALIVE) && thumbstone == null;
     }
 
     @Override
     public boolean isClosed() {
-        return state.getState() == StateHelper.CLOSED;
+        return state.isStateSet(StateHelper.CLOSED);
     }
 
     @Override
@@ -584,23 +740,38 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
     }
 
     @Override
-    public TarantoolClientOps<Integer, List<?>, Object, List<?>> syncOps() {
+    public TarantoolClientOps<List<?>, Object, List<?>> syncOps() {
         return syncOps;
     }
 
     @Override
-    public TarantoolClientOps<Integer, List<?>, Object, Future<List<?>>> asyncOps() {
+    public TarantoolClientOps<List<?>, Object, Future<List<?>>> asyncOps() {
         return (TarantoolClientOps) this;
     }
 
     @Override
-    public TarantoolClientOps<Integer, List<?>, Object, CompletionStage<List<?>>> composableAsyncOps() {
+    public TarantoolClientOps<List<?>, Object, CompletionStage<List<?>>> composableAsyncOps() {
         return composableAsyncOps;
     }
 
     @Override
-    public TarantoolClientOps<Integer, List<?>, Object, Long> fireAndForgetOps() {
+    public TarantoolClientOps<List<?>, Object, Long> fireAndForgetOps() {
         return fireAndForgetOps;
+    }
+
+    public TarantoolClientOps<List<?>, Object, TupleTwo<List<?>, Long>> unsafeSchemaOps() {
+        return unsafeSchemaOps;
+    }
+
+    protected TarantoolRequest makeSqlRequest(String sql, List<Object> bind) {
+        TarantoolRequest request = new TarantoolRequest(Code.EXECUTE);
+        request.addArguments(
+            RequestArguments.value(Key.SQL_TEXT),
+            RequestArguments.value(sql),
+            RequestArguments.value(Key.SQL_BIND),
+            RequestArguments.value(bind)
+        );
+        return request;
     }
 
     @Override
@@ -608,12 +779,12 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         return new TarantoolSQLOps<Object, Long, List<Map<String, Object>>>() {
             @Override
             public Long update(String sql, Object... bind) {
-                return (Long) syncGet(exec(Code.EXECUTE, Key.SQL_TEXT, sql, Key.SQL_BIND, bind));
+                return (Long) syncGet(exec(makeSqlRequest(sql, Arrays.asList(bind))));
             }
 
             @Override
             public List<Map<String, Object>> query(String sql, Object... bind) {
-                return (List<Map<String, Object>>) syncGet(exec(Code.EXECUTE, Key.SQL_TEXT, sql, Key.SQL_BIND, bind));
+                return (List<Map<String, Object>>) syncGet(exec(makeSqlRequest(sql, Arrays.asList(bind))));
             }
         };
     }
@@ -623,39 +794,32 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         return new TarantoolSQLOps<Object, Future<Long>, Future<List<Map<String, Object>>>>() {
             @Override
             public Future<Long> update(String sql, Object... bind) {
-                return (Future<Long>) exec(Code.EXECUTE, Key.SQL_TEXT, sql, Key.SQL_BIND, bind);
+                return (Future<Long>) exec(makeSqlRequest(sql, Arrays.asList(bind)));
             }
 
             @Override
             public Future<List<Map<String, Object>>> query(String sql, Object... bind) {
-                return (Future<List<Map<String, Object>>>) exec(Code.EXECUTE, Key.SQL_TEXT, sql, Key.SQL_BIND, bind);
+                return (Future<List<Map<String, Object>>>) exec(makeSqlRequest(sql, Arrays.asList(bind)));
             }
         };
     }
 
-    protected class SyncOps extends AbstractTarantoolOps<Integer, List<?>, Object, List<?>> {
+    protected class SyncOps extends BaseClientOps<List<?>> {
 
         @Override
-        public List exec(Code code, Object... args) {
-            return (List) syncGet(TarantoolClientImpl.this.exec(code, args));
-        }
-
-        @Override
-        public void close() {
-            throw new IllegalStateException("You should close TarantoolClient instead.");
+        protected List<?> exec(TarantoolRequest request) {
+            return (List) syncGet(TarantoolClientImpl.this.exec(request));
         }
 
     }
 
-    protected class FireAndForgetOps extends AbstractTarantoolOps<Integer, List<?>, Object, Long> {
+    protected class FireAndForgetOps extends BaseClientOps<Long> {
 
         @Override
-        public Long exec(Code code, Object... args) {
+        protected Long exec(TarantoolRequest request) {
             if (thumbstone == null) {
                 try {
-                    long syncId = TarantoolClientImpl.this.syncId.incrementAndGet();
-                    write(code, syncId, null, args);
-                    return syncId;
+                    return doExec(request).getId();
                 } catch (Exception e) {
                     throw new CommunicationException("Execute failed", e);
                 }
@@ -664,102 +828,14 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
             }
         }
 
-        @Override
-        public void close() {
-            throw new IllegalStateException("You should close TarantoolClient instead.");
-        }
-
     }
 
-    protected boolean isDead(TarantoolOp<?> future) {
+    protected boolean isDead(TarantoolRequest request) {
         if (this.thumbstone != null) {
-            fail(future, new CommunicationException("Connection is dead", thumbstone));
+            fail(request, new CommunicationException("Connection is dead", thumbstone));
             return true;
         }
         return false;
-    }
-
-    protected static class TarantoolOp<V> extends CompletableFuture<V> {
-
-        /**
-         * A task identifier used in {@link TarantoolClientImpl#futures}.
-         */
-        private final long id;
-
-        /**
-         * Tarantool binary protocol operation code.
-         */
-        private final Code code;
-
-        /**
-         * Arguments of operation.
-         */
-        private final Object[] args;
-
-        public TarantoolOp(long id, Code code, Object[] args) {
-            this.id = id;
-            this.code = code;
-            this.args = args;
-        }
-
-        public long getId() {
-            return id;
-        }
-
-        public Code getCode() {
-            return code;
-        }
-
-        public Object[] getArgs() {
-            return args;
-        }
-
-        /**
-         * Missed in jdk8 CompletableFuture operator to limit execution
-         * by time.
-         */
-        public TarantoolOp<V> orTimeout(long timeout, TimeUnit unit) {
-            if (timeout < 0) {
-                throw new IllegalArgumentException("Timeout cannot be negative");
-            }
-            if (unit == null) {
-                throw new IllegalArgumentException("Time unit cannot be null");
-            }
-            if (timeout == 0 || isDone()) {
-                return this;
-            }
-            ScheduledFuture<?> abandonByTimeoutAction = TimeoutScheduler.EXECUTOR.schedule(
-                () -> {
-                    if (!this.isDone()) {
-                        this.completeExceptionally(new TimeoutException());
-                    }
-                },
-                timeout, unit
-            );
-            whenComplete(
-                (ignored, error) -> {
-                    if (error == null && !abandonByTimeoutAction.isDone()) {
-                        abandonByTimeoutAction.cancel(false);
-                    }
-                }
-            );
-            return this;
-        }
-
-        /**
-         * Runs timeout operation as a delayed task.
-         */
-        static class TimeoutScheduler {
-
-            static final ScheduledThreadPoolExecutor EXECUTOR;
-
-            static {
-                EXECUTOR =
-                    new ScheduledThreadPoolExecutor(1, new TarantoolThreadDaemonFactory("tarantoolTimeout"));
-                EXECUTOR.setRemoveOnCancelPolicy(true);
-            }
-        }
-
     }
 
     /**
@@ -786,9 +862,12 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         static final int UNINITIALIZED = 0;
         static final int READING = 1;
         static final int WRITING = 2;
+
         static final int ALIVE = READING | WRITING;
-        static final int RECONNECT = 4;
-        static final int CLOSED = 8;
+        static final int SCHEMA_UPDATING = 1 << 2;
+
+        static final int RECONNECT = 1 << 3;
+        static final int CLOSED = 1 << 4;
 
         private final AtomicInteger state;
 
@@ -817,6 +896,10 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
             return state.get();
         }
 
+        boolean isStateSet(int mask) {
+            return (getState() & mask) == mask;
+        }
+
         /**
          * Set CLOSED state, drop RECONNECT state.
          */
@@ -825,12 +908,12 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
                 int currentState = getState();
 
                 /* CLOSED is the terminal state. */
-                if ((currentState & CLOSED) == CLOSED) {
+                if (isStateSet(CLOSED)) {
                     return false;
                 }
 
-                /*  Drop RECONNECT, set CLOSED. */
-                if (compareAndSet(currentState, (currentState & ~RECONNECT) | CLOSED)) {
+                /* Clear all states and set CLOSED. */
+                if (compareAndSet(currentState, CLOSED)) {
                     return true;
                 }
             }
@@ -846,7 +929,7 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
                 int currentState = getState();
 
                 /* CLOSED is the terminal state. */
-                if ((currentState & CLOSED) == CLOSED) {
+                if ((isStateSet(CLOSED))) {
                     return false;
                 }
 
@@ -856,8 +939,8 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
                 }
 
                 /* Cannot move from a state to the same state. */
-                if ((currentState & mask) != 0) {
-                    throw new IllegalStateException("State is already " + mask);
+                if (isStateSet(mask)) {
+                    return false;
                 }
 
                 /* Set acquired state. */
@@ -881,7 +964,8 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
                 return false;
             }
 
-            if (update == ALIVE) {
+            boolean wasAlreadyAlive = (expect & ALIVE) == ALIVE;
+            if (!wasAlreadyAlive && (update & ALIVE) == ALIVE) {
                 CountDownLatch latch = nextAliveLatch.getAndSet(new CountDownLatch(1));
                 latch.countDown();
                 onReconnect();
@@ -916,13 +1000,13 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
                 return closedLatch;
             }
             if (state == ALIVE) {
-                if (getState() == CLOSED) {
+                if (isStateSet(CLOSED)) {
                     throw new IllegalStateException("State is CLOSED.");
                 }
                 CountDownLatch latch = nextAliveLatch.get();
                 /* It may happen so that an error is detected but the state is still alive.
                  Wait for the 'next' alive state in such cases. */
-                return (getState() == ALIVE && thumbstone == null) ? null : latch;
+                return (isStateSet(ALIVE) && thumbstone == null) ? null : latch;
             }
             return null;
         }
@@ -935,7 +1019,7 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
         private void awaitReconnection() throws InterruptedException {
             connectorLock.lock();
             try {
-                while (getState() != StateHelper.RECONNECT) {
+                while (!isStateSet(RECONNECT)) {
                     reconnectRequired.await();
                 }
             } finally {
@@ -961,17 +1045,44 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
 
     }
 
-    protected class ComposableAsyncOps
-        extends AbstractTarantoolOps<Integer, List<?>, Object, CompletionStage<List<?>>> {
+    protected class ComposableAsyncOps extends BaseClientOps<CompletionStage<List<?>>> {
 
         @Override
-        public CompletionStage<List<?>> exec(Code code, Object... args) {
-            return (CompletionStage<List<?>>) TarantoolClientImpl.this.exec(code, args);
+        protected CompletionStage<List<?>> exec(TarantoolRequest request) {
+            return (CompletionStage<List<?>>) TarantoolClientImpl.this.exec(request);
         }
 
         @Override
         public void close() {
             TarantoolClientImpl.this.close();
+        }
+
+    }
+
+    /**
+     * Used by internal services to ignore schema ID issues.
+     */
+    protected class UnsafeSchemaOps extends BaseClientOps<TupleTwo<List<?>, Long>> {
+
+        protected TupleTwo<List<?>, Long> exec(TarantoolRequest request) {
+            long syncId = TarantoolClientImpl.this.syncId.incrementAndGet();
+            request.begin(syncId, operationTimeout);
+            List<?> result = (List<?>) syncGet(registerOperation(request, 0L).getResult());
+            return TupleTwo.of(result, request.getCompletedSchemaId());
+        }
+
+    }
+
+    protected abstract class BaseClientOps<R> extends AbstractTarantoolOps<R> {
+
+        @Override
+        protected TarantoolSchemaMeta getSchemaMeta() {
+            return TarantoolClientImpl.this.getSchemaMeta();
+        }
+
+        @Override
+        public void close() {
+            throw new IllegalStateException("You should close TarantoolClient instead.");
         }
 
     }

@@ -7,6 +7,7 @@ import static org.tarantool.TestAssumptions.assumeMinimalServerVersion;
 
 import org.tarantool.ServerVersion;
 import org.tarantool.TarantoolClientConfig;
+import org.tarantool.TarantoolRequest;
 import org.tarantool.TarantoolTestHelper;
 import org.tarantool.protocol.TarantoolPacket;
 
@@ -51,12 +52,12 @@ public class JdbcConnectionTimeoutIT {
             protected SQLTarantoolClientImpl makeSqlClient(String address, TarantoolClientConfig config) {
                 return new SQLTarantoolClientImpl(address, config) {
                     @Override
-                    protected void completeSql(TarantoolOp<?> operation, TarantoolPacket pack) {
+                    protected void completeSql(TarantoolRequest request, TarantoolPacket pack) {
                         try {
                             Thread.sleep(LONG_ENOUGH_TIMEOUT);
                         } catch (InterruptedException ignored) {
                         }
-                        super.completeSql(operation, pack);
+                        super.completeSql(request, pack);
                     }
                 };
             }

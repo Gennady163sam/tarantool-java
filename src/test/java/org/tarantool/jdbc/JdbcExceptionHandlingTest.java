@@ -46,7 +46,7 @@ public class JdbcExceptionHandlingTest {
     @Test
     public void testDatabaseMetaDataGetPrimaryKeysFormatError() throws SQLException {
 
-        TarantoolClientOps<Integer, List<?>, Object, List<?>> syncOps = mock(TarantoolClientOps.class);
+        TarantoolClientOps<List<?>, Object, List<?>> syncOps = mock(TarantoolClientOps.class);
 
         Object[] spc = new Object[7];
         spc[FORMAT_IDX] = Collections.singletonList(new HashMap<String, Object>());
@@ -195,7 +195,7 @@ public class JdbcExceptionHandlingTest {
     private void checkDatabaseMetaDataCommunicationException(final ThrowingConsumer<DatabaseMetaData> consumer,
                                                              String msg) throws SQLException {
         Exception ex = new CommunicationException("TEST");
-        TarantoolClientOps<Integer, List<?>, Object, List<?>> syncOps = mock(TarantoolClientOps.class);
+        TarantoolClientOps<List<?>, Object, List<?>> syncOps = mock(TarantoolClientOps.class);
         doThrow(ex).when(syncOps).select(_VSPACE, 0, Arrays.asList(), 0, SPACES_MAX, 0);
         doThrow(ex).when(syncOps).select(_VSPACE, 2, Arrays.asList("TEST"), 0, 1, 0);
 
@@ -212,7 +212,7 @@ public class JdbcExceptionHandlingTest {
     }
 
     private SQLTarantoolClientImpl buildSQLClient(SQLTarantoolClientImpl.SQLRawOps sqlOps,
-                                                  TarantoolClientOps<Integer, List<?>, Object, List<?>> ops) {
+                                                  TarantoolClientOps<List<?>, Object, List<?>> ops) {
         SQLTarantoolClientImpl client = mock(SQLTarantoolClientImpl.class);
         when(client.sqlRawOps()).thenReturn(sqlOps);
         when(client.syncOps()).thenReturn(ops);
