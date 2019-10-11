@@ -1,5 +1,6 @@
 package org.tarantool;
 
+import org.tarantool.dsl.TarantoolRequestConvertible;
 import org.tarantool.schema.TarantoolSchemaMeta;
 
 import java.util.List;
@@ -32,5 +33,7 @@ public interface TarantoolClient {
     boolean waitAlive(long timeout, TimeUnit unit) throws InterruptedException;
 
     TarantoolSchemaMeta getSchemaMeta();
+
+    TarantoolResultSet executeRequest(TarantoolRequestConvertible requestSpec);
 
 }

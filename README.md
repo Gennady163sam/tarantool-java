@@ -221,7 +221,81 @@ against its integer IDs.
    and server's versions matches. It may take significant amount of time or even be
    a cause of request timeout.
 3. The client guarantees an order of synchronous requests per thread. Other cases such
-   as asynchronous or multi-threaded requests may be out of order before the execution.            
+   as asynchronous or multi-threaded requests may be out of order before the execution.
+
+### Getting a result
+
+Traditionally, when a response is parsed by the internal MsgPack implementation the client
+will return it as a heterogeneous list of objects `List` that in most cases is inconvenient
+for users to use. It requires a type guessing as well as a writing more boilerplate code to work
+with typed data. Most of the methods which are provided by `TarantoolClientOps` (i.e. `select`)
+return raw de-serialized data via `List`. 
+
+Consider a small example how it is usually used:
+
+```java
+// get an untyped array of tuples
+List<?> result = client.syncOps().execute(Requests.selectRequest("space", "pk"));
+for (int i = 0; i < result.size(); i++) {
+    // get the first tuple (also untyped)
+    List<?> row = result.get(i);
+    // try to cast the first tuple as a couple of values
+    int id = (int) row.get(0);
+    String text = (String) row.get(1);
+    processEntry(id, text);
+}
+```
+
+There is an additional way to work with data using `TarantoolClient.executeRequest(TarantoolRequestConvertible)`
+method. This method returns a result wrapper over original data that allows to extract in a more
+typed manner rather than it is directly provided by MsgPack serialization. The `executeRequest`
+returns the `TarantoolResultSet` which provides a bunch of methods to get data. Inside the result
+set the data is represented as a list of rows (tuples) where each row has columns (fields).
+In general, it is possible that different rows have different size of their columns in scope of
+the same result. 
+
+```java
+TarantoolResultSet result = client.executeRequest(Requests.selectRequest("space", "pk"));
+while (result.next()) {
+    long id = result.getLong(0);
+    String text = result.getString(1);
+    processEntry(id, text);
+}
+```
+
+The `TarantoolResultSet` provides an implicit conversation between types if it's possible.
+
+Numeric types internally can represent each other if a type range allows to do it. For example,
+byte 100 can be represented as a short, int and other types wider than byte. But 200 integer
+cannot be narrowed to a byte because of overflow (byte range is [-128..127]). If a floating
+point number is converted to a integer then the fraction part will be omitted. It is also
+possible to convert a valid string to a number. 
+
+Boolean type can be obtained from numeric types such as byte, short, int, long, BigInteger,
+float and double where 1 (1.0) means true and 0 (0.0) means false. Or it can be got from
+a string using well-known patterns such as "1", "t|true", "y|yes", "on" for true and
+"0", "f|false", "n|no", "off" for false respectively.
+
+String type can be converted from a byte array and any numeric types. In case of `byte[]`
+all bytes will be interpreted as a UTF-8 sequence.  
+
+There is a special method called `getObject(int, Map)` where a user can provide its own
+mapping functions to be applied if a designated type matches a value one.
+
+For instance, using the following map each strings will be transformed to an upper case and
+boolean values will be represented as strings "yes" or "no":
+
+```java
+Map<Class<?>, Function<Object, Object>> mappers = new HashMap<>();
+mappers.put(
+    String.class,
+    v -> ((String) v).toUpperCase()
+);
+mappers.put(
+    Boolean.class,
+    v -> (boolean) v ? "yes" : "no"
+);
+``` 
 
 ## Spring NamedParameterJdbcTemplate usage example
 

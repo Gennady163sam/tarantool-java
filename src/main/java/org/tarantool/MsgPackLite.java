@@ -10,6 +10,7 @@ import java.io.OutputStream;
 import java.lang.reflect.Array;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -359,7 +360,7 @@ public class MsgPackLite {
 
         byte[] data = new byte[size];
         in.readFully(data);
-        return new String(data, "UTF-8");
+        return new String(data, StandardCharsets.UTF_8);
     }
 
     protected Object unpackBin(int size, DataInputStream in) throws IOException {

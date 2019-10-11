@@ -1,5 +1,6 @@
 package org.tarantool;
 
+import org.tarantool.dsl.TarantoolRequestConvertible;
 import org.tarantool.protocol.ProtoConstants;
 import org.tarantool.protocol.ProtoUtils;
 import org.tarantool.protocol.ReadableViaSelectorChannel;
@@ -264,6 +265,17 @@ public class TarantoolClientImpl extends TarantoolBase<Future<?>> implements Tar
     @Override
     public TarantoolSchemaMeta getSchemaMeta() {
         return schemaMeta;
+    }
+
+    @Override
+    public TarantoolResultSet executeRequest(TarantoolRequestConvertible requestSpec) {
+        TarantoolRequest request = requestSpec.toTarantoolRequest(getSchemaMeta());
+        List<?> result = (List<?>) syncGet(exec(request));
+        return new InMemoryResultSet(result, isSingleResultRow(request.getCode()));
+    }
+
+    private boolean isSingleResultRow(Code code) {
+        return code == Code.EVAL || code == Code.CALL || code == Code.OLD_CALL;
     }
 
     /**
